@@ -1,0 +1,31 @@
+[project]
+name = "PDPC"
+database = "pdpc.db"
+title = "PDPC Singapore"
+description = "Enforcement decisions and regulatory materials from the Personal Data Protection Commission (PDPC) Singapore."
+license = "CC-BY-SA 4.0"
+license_url = "https://creativecommons.org/licenses/by-sa/4.0/"
+source = "Personal Data Protection Commission"
+source_url = "https://www.pdpc.gov.sg/"
+
+[resource.enforcement_decisions]
+description = "PDPC enforcement decisions under the Personal Data Protection Act (PDPA): Commission's Decisions and Voluntary Undertakings."
+sort_desc = "decision_date"
+label_column = "title"
+facets = ["decision_type"]
+fragments = true
+fts_fields = ["title", "organisation", "decision_type", "summary"]
+fragments_fts_fields = ["text"]
+size = 20
+
+[resource.enforcement_decisions.columns]
+id = "PDPC internal UUID for this decision"
+title = "Full decision title as published on pdpc.gov.sg"
+organisation = "Respondent organisation name (extracted from title)"
+decision_type = "Commission's Decisions or Voluntary Undertakings"
+decision_date = "Date of the enforcement decision (ISO 8601)"
+decision_url = "URL to the decision page on pdpc.gov.sg"
+penalty_amount = "Financial penalty in SGD (null if not applicable)"
+summary = "Brief description from the decision page (2–4 sentences)"
+pdf_url = "URL to the full decision document (PDF asset)"
+imported_on = "Timestamp when the record was imported"
