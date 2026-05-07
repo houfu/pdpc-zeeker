@@ -78,6 +78,19 @@ _NEXT_F_PUSH_RE = re.compile(
 
 DB_PATH = "pdpc.db"  # relative to project root where zeeker runs
 
+# os.environ sentinel: set to str(os.getpid()) after backfill runs once per process.
+# Module-level variables are reset on each zeeker module reload, but os.environ persists.
+_BACKFILL_SENTINEL_KEY = "_PDPC_BACKFILL_RAN_PID"
+
+FRAGMENT_COLUMNS = {
+    "id": str,
+    "parent_id": str,
+    "text": str,
+    "sequence": int,
+    "content_type": str,
+    "char_count": int,
+}
+
 
 # =============================================================================
 # HELPERS
@@ -87,6 +100,110 @@ def _polite_sleep():
     time.sleep(max(0.5, REQUEST_DELAY_BASE + random.uniform(
         -REQUEST_DELAY_JITTER, REQUEST_DELAY_JITTER
     )))
+
+
+def _ensure_fragments_table(db) -> None:
+    """Create enforcement_decisions_fragments if it doesn't exist."""
+    import sqlite_utils as _su
+    tbl = db["enforcement_decisions_fragments"]
+    if not tbl.exists():
+        db["enforcement_decisions_fragments"].create(
+            FRAGMENT_COLUMNS, pk="id", if_not_exists=True
+        )
+
+
+def _run_fragment_backfill(db) -> None:
+    """Fetch PDFs and insert fragments for decisions that don't have any yet.
+
+    Runs inline from fetch_data() as a side effect so it executes even when
+    fetch_data returns [] (zeeker marks the resource as 'skipped' in that case
+    and never calls fetch_fragments_data). Uses os.environ sentinel to run at
+    most once per process across zeeker's multiple fetch_data calls per build.
+    """
+    sentinel = _BACKFILL_SENTINEL_KEY
+    if os.environ.get(sentinel) == str(os.getpid()):
+        return  # Already ran in this process
+    os.environ[sentinel] = str(os.getpid())
+
+    _ensure_fragments_table(db)
+
+    # Decisions that have a pdf_url but no fragments yet
+    existing_parent_ids: set = set()
+    frags_tbl = db["enforcement_decisions_fragments"]
+    if frags_tbl.exists():
+        for row in frags_tbl.rows_where(select="parent_id"):
+            existing_parent_ids.add(row["parent_id"])
+
+    all_decisions = list(db["enforcement_decisions"].rows_where(
+        "pdf_url IS NOT NULL AND pdf_url != ''"
+    ))
+
+    checkpoint = _load_backfill_checkpoint()
+    now_ts = datetime.now(timezone.utc).isoformat()
+
+    candidates = [
+        d for d in all_decisions
+        if d["id"] not in existing_parent_ids
+        and checkpoint.get(d["id"], {}).get("failures", 0) < BACKFILL_MAX_RETRIES
+    ]
+
+    total_pending = len(candidates)
+    quarantined = sum(1 for v in checkpoint.values() if v.get("failures", 0) >= BACKFILL_MAX_RETRIES)
+
+    if not candidates:
+        click.echo(f"Fragment backfill: nothing to do ({quarantined} quarantined).")
+        return
+
+    batch = candidates[:BACKFILL_BATCH_SIZE]
+    click.echo(
+        f"Fragment backfill: {total_pending} pending, {quarantined} quarantined — "
+        f"processing {len(batch)} this run."
+    )
+
+    successes = 0
+    failures = 0
+
+    existing_frag_ids: set = set()
+    if frags_tbl.exists():
+        for row in frags_tbl.rows_where(select="id"):
+            existing_frag_ids.add(row["id"])
+
+    with _make_client() as client:
+        for decision in batch:
+            did = decision["id"]
+            pdf_url = decision["pdf_url"]
+            title_short = decision.get("title", "")[:50]
+            try:
+                _polite_sleep()
+                pdf_bytes = _fetch_bytes(client, pdf_url)
+                pdf_text = _convert_pdf_with_docling(pdf_bytes)
+                if not pdf_text or len(pdf_text) < 50:
+                    raise ValueError(f"empty PDF text ({len(pdf_text)} chars)")
+                chunks = _chunk_text(pdf_text, did, existing_frag_ids)
+                if chunks:
+                    db["enforcement_decisions_fragments"].insert_all(chunks, replace=False, ignore=True)
+                    existing_frag_ids.update(c["id"] for c in chunks)
+                click.echo(f"  OK  {did[:8]} | {title_short} | {len(chunks)} chunks")
+                successes += 1
+                if did in checkpoint:
+                    del checkpoint[did]
+                    _save_backfill_checkpoint(checkpoint)
+            except Exception as e:
+                failures += 1
+                rec = checkpoint.get(did, {"failures": 0})
+                rec["failures"] = rec.get("failures", 0) + 1
+                rec["last_error"] = str(e)[:200]
+                rec["last_attempt"] = now_ts
+                checkpoint[did] = rec
+                _save_backfill_checkpoint(checkpoint)
+                click.echo(f"  FAIL {did[:8]} | {str(e)[:80]}", err=True)
+
+    new_quarantined = sum(1 for v in checkpoint.values() if v.get("failures", 0) >= BACKFILL_MAX_RETRIES)
+    remaining = total_pending - len(batch)
+    click.echo(
+        f"Fragment backfill done: {successes} OK, {failures} failed, "
+        f"{new_quarantined} quarantined, {remaining} still pending."
+    )
 
 
 def _load_backfill_checkpoint() -> Dict[str, Any]:
@@ -320,6 +437,12 @@ def _parse_detail_page(html: str) -> Dict[str, Any]:
 # =============================================================================
 
 def fetch_data(existing_table) -> List[Dict[str, Any]]:
+    # Fragment backfill runs as a side effect here (once per process via os.environ sentinel)
+    # because zeeker only calls fetch_fragments_data when fetch_data returns new records.
+    # On steady-state days (no new decisions), fragments would never be processed otherwise.
+    if existing_table:
+        _run_fragment_backfill(existing_table.db)
+
     existing_ids: set = set()
     if existing_table:
         existing_ids = {row["id"] for row in existing_table.rows}
@@ -472,97 +595,10 @@ def _chunk_text(text: str, decision_id: str, existing_fragment_ids: set) -> List
 
 
 def fetch_fragments_data(existing_fragments_table, main_data_context=None) -> List[Dict[str, Any]]:
-    """Chunk PDF text into fragments for FTS.
+    """Stub — fragment backfill is handled inline in fetch_data() via _run_fragment_backfill().
 
-    Backfill mode: queries DB_PATH directly for all decisions with pdf_url that don't
-    yet have fragments. Processes PDPC_BACKFILL_BATCH_SIZE per run. Failures tracked in
-    checkpoint_pdpc_fragments.json; decisions failing PDPC_BACKFILL_MAX_RETRIES are
-    quarantined.
-
-    Note: main_data_context is always [] (zeeker's second fetch_data call returns nothing
-    for existing records), so we bypass it and query the DB directly instead.
+    zeeker only calls fetch_fragments_data when fetch_data returns new records ("success"),
+    but the backfill needs to run on every build. The side-effect approach in fetch_data
+    bypasses this limitation entirely.
     """
-    import sqlite_utils as _sqlite_utils
-
-    existing_fragment_ids: set = set()
-    fragmented_parents: set = set()
-    if existing_fragments_table:
-        for row in existing_fragments_table.rows:
-            existing_fragment_ids.add(row["id"])
-            fragmented_parents.add(row["parent_id"])
-
-    # Query main table directly — new records are already committed before this runs
-    try:
-        _db = _sqlite_utils.Database(DB_PATH)
-        all_decisions = list(_db["enforcement_decisions"].rows_where(
-            "pdf_url IS NOT NULL AND pdf_url != ''"
-        ))
-    except Exception as e:
-        click.echo(f"Fragment backfill: could not open {DB_PATH}: {e}", err=True)
-        return []
-
-    checkpoint = _load_backfill_checkpoint()
-    now_ts = datetime.now(timezone.utc).isoformat()
-
-    candidates = [
-        d for d in all_decisions
-        if d["id"] not in fragmented_parents
-        and checkpoint.get(d["id"], {}).get("failures", 0) < BACKFILL_MAX_RETRIES
-    ]
-
-    total_pending = len(candidates)
-    quarantined = sum(
-        1 for v in checkpoint.values() if v.get("failures", 0) >= BACKFILL_MAX_RETRIES
-    )
-
-    if not candidates:
-        click.echo(f"Fragment backfill: nothing to do (quarantined: {quarantined}).")
-        return []
-
-    batch = candidates[:BACKFILL_BATCH_SIZE]
-    click.echo(
-        f"Fragment backfill: {total_pending} pending, {quarantined} quarantined — "
-        f"processing {len(batch)} this run."
-    )
-
-    fragments = []
-    successes = 0
-    failures = 0
-
-    with _make_client() as client:
-        for decision in batch:
-            did = decision["id"]
-            pdf_url = decision["pdf_url"]
-            title_short = decision.get("title", "")[:50]
-            try:
-                _polite_sleep()
-                pdf_bytes = _fetch_bytes(client, pdf_url)
-                pdf_text = _convert_pdf_with_docling(pdf_bytes)
-                if not pdf_text or len(pdf_text) < 50:
-                    raise ValueError(f"empty PDF text ({len(pdf_text)} chars)")
-                chunks = _chunk_text(pdf_text, did, existing_fragment_ids)
-                fragments.extend(chunks)
-                click.echo(f"  OK  {did[:8]} | {title_short} | {len(chunks)} chunks")
-                successes += 1
-                if did in checkpoint:
-                    del checkpoint[did]
-                    _save_backfill_checkpoint(checkpoint)
-            except Exception as e:
-                failures += 1
-                rec = checkpoint.get(did, {"failures": 0})
-                rec["failures"] = rec.get("failures", 0) + 1
-                rec["last_error"] = str(e)[:200]
-                rec["last_attempt"] = now_ts
-                checkpoint[did] = rec
-                _save_backfill_checkpoint(checkpoint)
-                click.echo(f"  FAIL {did[:8]} | {str(e)[:80]}", err=True)
-
-    new_quarantined = sum(
-        1 for v in checkpoint.values() if v.get("failures", 0) >= BACKFILL_MAX_RETRIES
-    )
-    remaining = total_pending - len(batch)
-    click.echo(
-        f"Fragment backfill done: {successes} OK, {failures} failed this run, "
-        f"{new_quarantined} quarantined total, {remaining} still pending."
-    )
-    return fragments
+    return []
