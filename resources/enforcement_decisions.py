@@ -447,12 +447,17 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
     return results
 
 
-def migrate_schema(db) -> None:
+def migrate_schema(existing_table, migration) -> bool:
     """Keep penalty_amount as REAL even when an all-null batch causes zeeker to infer TEXT.
     Voluntary Undertakings carry no financial penalty, so batches of VUs produce all-None
     penalty_amount values. SQLite REAL and NULL are compatible — no column alteration needed.
+    We patch the inferred schema in-place (migration["new_schema"] is the same object zeeker
+    will pass to update_schema_tracking) to prevent TEXT from being stored as the new type.
     """
-    pass
+    new_schema = migration.get("new_schema", {})
+    if new_schema.get("penalty_amount") == "TEXT":
+        new_schema["penalty_amount"] = "REAL"
+    return True
 
 
 def _chunk_text(text: str, decision_id: str, existing_fragment_ids: set) -> List[Dict[str, Any]]:
