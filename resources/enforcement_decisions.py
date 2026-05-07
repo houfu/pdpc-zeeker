@@ -76,11 +76,7 @@ _NEXT_F_PUSH_RE = re.compile(
     r'self\.__next_f\.push\(\[\s*\d+\s*,\s*"((?:[^"\\]|\\.)*)"\s*\]\)'
 )
 
-# Cache for PDF texts across zeeker's two fetch_data() calls within one build.
-# Zeeker calls fetch_data() twice: once to insert main records (returns new records),
-# then again to build main_data_context for fragments (returns [] since all are now known).
-# Only update when non-empty so the second call doesn't clobber the cache.
-_pending_for_fragments: List[Dict[str, Any]] = []
+DB_PATH = "pdpc.db"  # relative to project root where zeeker runs
 
 
 # =============================================================================
@@ -324,8 +320,6 @@ def _parse_detail_page(html: str) -> Dict[str, Any]:
 # =============================================================================
 
 def fetch_data(existing_table) -> List[Dict[str, Any]]:
-    global _pending_for_fragments
-
     existing_ids: set = set()
     if existing_table:
         existing_ids = {row["id"] for row in existing_table.rows}
@@ -433,12 +427,6 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
                 click.echo(f"  All items on page {page} already known — stopping.")
                 break
 
-    # Cache records with _pdf_text before stripping — zeeker calls fetch_data() a second time
-    # to build main_data_context for fragments, but that second call returns [] (all existing).
-    # Only update cache when we actually have new records to avoid clobbering on the second call.
-    if results:
-        _pending_for_fragments = [dict(r) for r in results]
-
     # Strip internal field before inserting into DB
     for r in results:
         r.pop("_pdf_text", None)
@@ -486,13 +474,15 @@ def _chunk_text(text: str, decision_id: str, existing_fragment_ids: set) -> List
 def fetch_fragments_data(existing_fragments_table, main_data_context=None) -> List[Dict[str, Any]]:
     """Chunk PDF text into fragments for FTS.
 
-    Two modes:
-    - Cache mode: new records fetched this build run (via _pending_for_fragments).
-    - Backfill mode: existing decisions without fragments, processed in batches of
-      PDPC_BACKFILL_BATCH_SIZE (default 10). Failures tracked in checkpoint_pdpc_fragments.json;
-      decisions failing PDPC_BACKFILL_MAX_RETRIES times are quarantined.
+    Backfill mode: queries DB_PATH directly for all decisions with pdf_url that don't
+    yet have fragments. Processes PDPC_BACKFILL_BATCH_SIZE per run. Failures tracked in
+    checkpoint_pdpc_fragments.json; decisions failing PDPC_BACKFILL_MAX_RETRIES are
+    quarantined.
+
+    Note: main_data_context is always [] (zeeker's second fetch_data call returns nothing
+    for existing records), so we bypass it and query the DB directly instead.
     """
-    global _pending_for_fragments
+    import sqlite_utils as _sqlite_utils
 
     existing_fragment_ids: set = set()
     fragmented_parents: set = set()
@@ -501,30 +491,22 @@ def fetch_fragments_data(existing_fragments_table, main_data_context=None) -> Li
             existing_fragment_ids.add(row["id"])
             fragmented_parents.add(row["parent_id"])
 
-    # --- Mode 1: new records from this build run ---
-    if _pending_for_fragments:
-        fragments = []
-        for decision in _pending_for_fragments:
-            text = decision.get("_pdf_text", "")
-            if not text or len(text) < 50:
-                click.echo(f"  skip fragments {decision['id'][:8]}: no PDF text")
-                continue
-            chunks = _chunk_text(text, decision["id"], existing_fragment_ids)
-            fragments.extend(chunks)
-            click.echo(f"  {decision['id'][:8]}: {len(chunks)} chunks")
-        return fragments
-
-    # --- Mode 2: backfill ---
-    if not main_data_context:
+    # Query main table directly — new records are already committed before this runs
+    try:
+        _db = _sqlite_utils.Database(DB_PATH)
+        all_decisions = list(_db["enforcement_decisions"].rows_where(
+            "pdf_url IS NOT NULL AND pdf_url != ''"
+        ))
+    except Exception as e:
+        click.echo(f"Fragment backfill: could not open {DB_PATH}: {e}", err=True)
         return []
 
     checkpoint = _load_backfill_checkpoint()
     now_ts = datetime.now(timezone.utc).isoformat()
 
     candidates = [
-        d for d in main_data_context
-        if d.get("pdf_url")
-        and d["id"] not in fragmented_parents
+        d for d in all_decisions
+        if d["id"] not in fragmented_parents
         and checkpoint.get(d["id"], {}).get("failures", 0) < BACKFILL_MAX_RETRIES
     ]
 
