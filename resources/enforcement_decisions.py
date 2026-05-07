@@ -53,7 +53,11 @@ LISTING_SLUG = "organisations/regulations-decisions/enforcement-decisions"
 LISTING_PATHNAME = "/" + LISTING_SLUG
 ITEMS_PER_PAGE = 10
 
-DOCLING_SERVE_URL = os.environ.get("DOCLING_SERVE_URL", "http://host.docker.internal:5001")
+DOCLING_SERVE_URL = os.environ.get("DOCLING_SERVE_URL", "http://localhost:5001")
+
+BACKFILL_BATCH_SIZE = int(os.environ.get("PDPC_BACKFILL_BATCH_SIZE", "10"))
+BACKFILL_MAX_RETRIES = int(os.environ.get("PDPC_BACKFILL_MAX_RETRIES", "3"))
+BACKFILL_CHECKPOINT = "checkpoint_pdpc_fragments.json"
 
 REQUEST_DELAY_BASE = 1.5
 REQUEST_DELAY_JITTER = 0.5
@@ -87,6 +91,21 @@ def _polite_sleep():
     time.sleep(max(0.5, REQUEST_DELAY_BASE + random.uniform(
         -REQUEST_DELAY_JITTER, REQUEST_DELAY_JITTER
     )))
+
+
+def _load_backfill_checkpoint() -> Dict[str, Any]:
+    try:
+        with open(BACKFILL_CHECKPOINT) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_backfill_checkpoint(data: Dict[str, Any]) -> None:
+    tmp = BACKFILL_CHECKPOINT + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, BACKFILL_CHECKPOINT)
 
 
 def _make_client() -> httpx.Client:
@@ -428,44 +447,127 @@ def fetch_data(existing_table) -> List[Dict[str, Any]]:
     return results
 
 
-def fetch_fragments_data(existing_fragments_table, main_data_context=None) -> List[Dict[str, Any]]:
-    """Chunk PDF text into fragments for FTS. Skips records without PDF text.
+def _chunk_text(text: str, decision_id: str, existing_fragment_ids: set) -> List[Dict[str, Any]]:
+    """Split PDF text into overlapping chunks for FTS."""
+    chunk_size = 1200
+    overlap = 150
+    fragments = []
+    start, seq = 0, 0
+    while start < len(text):
+        chunk = text[start: start + chunk_size]
+        frag_id = f"{decision_id}_chunk_{seq}"
+        if frag_id not in existing_fragment_ids:
+            fragments.append({
+                "id": frag_id,
+                "parent_id": decision_id,
+                "text": chunk,
+                "sequence": seq,
+                "content_type": "text",
+                "char_count": len(chunk),
+            })
+        start += chunk_size - overlap
+        seq += 1
+    return fragments
 
-    Fragments are from the full decision document only — not from the brief
-    HTML summary on the main record.
+
+def fetch_fragments_data(existing_fragments_table, main_data_context=None) -> List[Dict[str, Any]]:
+    """Chunk PDF text into fragments for FTS.
+
+    Two modes:
+    - Cache mode: new records fetched this build run (via _pending_for_fragments).
+    - Backfill mode: existing decisions without fragments, processed in batches of
+      PDPC_BACKFILL_BATCH_SIZE (default 10). Failures tracked in checkpoint_pdpc_fragments.json;
+      decisions failing PDPC_BACKFILL_MAX_RETRIES times are quarantined.
     """
     global _pending_for_fragments
 
-    data = _pending_for_fragments
-    if not data:
+    existing_fragment_ids: set = set()
+    fragmented_parents: set = set()
+    if existing_fragments_table:
+        for row in existing_fragments_table.rows:
+            existing_fragment_ids.add(row["id"])
+            fragmented_parents.add(row["parent_id"])
+
+    # --- Mode 1: new records from this build run ---
+    if _pending_for_fragments:
+        fragments = []
+        for decision in _pending_for_fragments:
+            text = decision.get("_pdf_text", "")
+            if not text or len(text) < 50:
+                click.echo(f"  skip fragments {decision['id'][:8]}: no PDF text")
+                continue
+            chunks = _chunk_text(text, decision["id"], existing_fragment_ids)
+            fragments.extend(chunks)
+            click.echo(f"  {decision['id'][:8]}: {len(chunks)} chunks")
+        return fragments
+
+    # --- Mode 2: backfill ---
+    if not main_data_context:
         return []
 
-    existing_fragment_ids: set = set()
-    if existing_fragments_table:
-        existing_fragment_ids = {row["id"] for row in existing_fragments_table.rows}
+    checkpoint = _load_backfill_checkpoint()
+    now_ts = datetime.now(timezone.utc).isoformat()
+
+    candidates = [
+        d for d in main_data_context
+        if d.get("pdf_url")
+        and d["id"] not in fragmented_parents
+        and checkpoint.get(d["id"], {}).get("failures", 0) < BACKFILL_MAX_RETRIES
+    ]
+
+    total_pending = len(candidates)
+    quarantined = sum(
+        1 for v in checkpoint.values() if v.get("failures", 0) >= BACKFILL_MAX_RETRIES
+    )
+
+    if not candidates:
+        click.echo(f"Fragment backfill: nothing to do (quarantined: {quarantined}).")
+        return []
+
+    batch = candidates[:BACKFILL_BATCH_SIZE]
+    click.echo(
+        f"Fragment backfill: {total_pending} pending, {quarantined} quarantined — "
+        f"processing {len(batch)} this run."
+    )
 
     fragments = []
-    chunk_size = 1200
-    overlap = 150
+    successes = 0
+    failures = 0
 
-    for decision in data:
-        text = decision.get("_pdf_text", "")
-        if not text or len(text) < 50:
-            continue
-        start, seq = 0, 0
-        while start < len(text):
-            chunk = text[start: start + chunk_size]
-            frag_id = f"{decision['id']}_chunk_{seq}"
-            if frag_id not in existing_fragment_ids:
-                fragments.append({
-                    "id": frag_id,
-                    "parent_id": decision["id"],
-                    "text": chunk,
-                    "sequence": seq,
-                    "content_type": "text",
-                    "char_count": len(chunk),
-                })
-            start += chunk_size - overlap
-            seq += 1
+    with _make_client() as client:
+        for decision in batch:
+            did = decision["id"]
+            pdf_url = decision["pdf_url"]
+            title_short = decision.get("title", "")[:50]
+            try:
+                _polite_sleep()
+                pdf_bytes = _fetch_bytes(client, pdf_url)
+                pdf_text = _convert_pdf_with_docling(pdf_bytes)
+                if not pdf_text or len(pdf_text) < 50:
+                    raise ValueError(f"empty PDF text ({len(pdf_text)} chars)")
+                chunks = _chunk_text(pdf_text, did, existing_fragment_ids)
+                fragments.extend(chunks)
+                click.echo(f"  OK  {did[:8]} | {title_short} | {len(chunks)} chunks")
+                successes += 1
+                if did in checkpoint:
+                    del checkpoint[did]
+                    _save_backfill_checkpoint(checkpoint)
+            except Exception as e:
+                failures += 1
+                rec = checkpoint.get(did, {"failures": 0})
+                rec["failures"] = rec.get("failures", 0) + 1
+                rec["last_error"] = str(e)[:200]
+                rec["last_attempt"] = now_ts
+                checkpoint[did] = rec
+                _save_backfill_checkpoint(checkpoint)
+                click.echo(f"  FAIL {did[:8]} | {str(e)[:80]}", err=True)
 
+    new_quarantined = sum(
+        1 for v in checkpoint.values() if v.get("failures", 0) >= BACKFILL_MAX_RETRIES
+    )
+    remaining = total_pending - len(batch)
+    click.echo(
+        f"Fragment backfill done: {successes} OK, {failures} failed this run, "
+        f"{new_quarantined} quarantined total, {remaining} still pending."
+    )
     return fragments
