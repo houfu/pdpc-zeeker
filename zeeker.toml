@@ -29,3 +29,11 @@ penalty_amount = "Financial penalty in SGD (null if not applicable)"
 summary = "Brief description from the decision page (2–4 sentences)"
 pdf_url = "URL to the full decision document (PDF asset)"
 imported_on = "Timestamp when the record was imported"
+
+[resource.enforcement_decisions_fragments.columns]
+id = "Unique identifier for this text chunk ({decision_id}_chunk_{sequence})"
+parent_id = "ID of the parent decision in enforcement_decisions"
+text = "Text chunk from the PDF decision document (1200-char chunks with 150-char overlap)"
+sequence = "Position of this chunk within the decision document (0-indexed)"
+content_type = "Source format of this chunk (currently always 'pdf_markdown')"
+char_count = "Character count of this chunk"
